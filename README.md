@@ -25,3 +25,5 @@ If you use Claude Code:
 ln -sf ~/.brynq-ai-toolkit/pr-review/customer/skill ~/.claude/skills/pr-review-customer
 ```
 Then run `/pr-review-customer` inside this repo for an AI-assisted review (SDK usage, error handling, pandas idioms, hardcoded config, etc.).
+
+<!-- BrynQ PR checks verified by automated rollout test on 2026-05-08 (batch 20) -->
