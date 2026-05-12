@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# BrynQ Customer Interface — Pre-push hook driver.
+# Runs all customer PR rule checks before push.
+# Uses salure pattern: stderr routing, log file, unified header.
+
+set -uo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+LOG_FILE="$(git rev-parse --git-dir)/last-push-report.log"
+
+# Find CHECKS_DIR (customer/checks/). Priority:
+#   1. env CUSTOMER_CHECKS_DIR (explicit override)
+#   2. Sibling to this hook (toolkit dev mode: pr-review/customer/git-hooks/pre-push → ../checks)
+#   3. ~/.brynq-ai-toolkit/pr-review/customer/checks (canonical install path)
+#   4. ~/brynq-ai-toolkit/pr-review/customer/checks (some devs clone here)
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CHECKS_DIR=""
+for candidate in \
+    "${CUSTOMER_CHECKS_DIR:-}" \
+    "${HOOK_DIR}/../checks" \
+    "${HOME}/.brynq-ai-toolkit/pr-review/customer/checks" \
+    "${HOME}/brynq-ai-toolkit/pr-review/customer/checks"; do
+    if [ -n "$candidate" ] && [ -d "$candidate" ] && [ -f "$candidate/repo_hygiene.py" ]; then
+        CHECKS_DIR="$candidate"
+        break
+    fi
+done
+
+if [ -z "$CHECKS_DIR" ]; then
+    echo "" >&2
+    echo "[pre-push] brynq-ai-toolkit checks not found." >&2
+    echo "  Run: bash scripts/install-hooks.sh   (clones toolkit + configures hooks)" >&2
+    echo "  Or set: export CUSTOMER_CHECKS_DIR=/path/to/brynq-ai-toolkit/pr-review/customer/checks" >&2
+    echo "" >&2
+    exit 0  # don't block push when toolkit is missing — surface message, let user fix
+fi
+
+if python3 -c "pass" &>/dev/null 2>&1; then
+    PYTHON="python3"
+elif python -c "pass" &>/dev/null 2>&1; then
+    PYTHON="python"
+else
+    echo "[pre-push] python not found in PATH — install Python 3.10+" >&2
+    exit 1
+fi
+
+# Route output to stderr + log file (salure convention).
+exec 1>&2
+: > "$LOG_FILE"
+
+say() { printf '%s\n' "$*"; printf '%s\n' "$*" >> "$LOG_FILE"; }
+
+run_check() {
+    local name="$1"; shift
+    local output rc=0
+    output=$("$@" 2>&1) || rc=$?
+    if [ -n "$output" ]; then
+        printf '%s\n' "$output"
+        printf '%s\n' "$output" >> "$LOG_FILE"
+    fi
+    if [ $rc -eq 0 ]; then
+        say "  [PASS] $name"
+    else
+        say "  [FAIL] $name"
+    fi
+    return $rc
+}
+
+# Determine if we're pushing to master/main (for version_check)
+PUSH_TO_PROTECTED=0
+while IFS=' ' read -r LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
+    case "$REMOTE_REF" in
+        refs/heads/master|refs/heads/main) PUSH_TO_PROTECTED=1 ;;
+    esac
+done
+
+cd "$REPO_ROOT"
+
+# Determine base ref for diff (origin/master, else origin/main).
+if git rev-parse --verify origin/master &>/dev/null; then
+    DIFF_BASE="origin/master"
+elif git rev-parse --verify origin/main &>/dev/null; then
+    DIFF_BASE="origin/main"
+else
+    echo "[pre-push] No origin/master or origin/main — skipping checks." >&2
+    exit 0
+fi
+
+CHANGED_LINES_JSON="$(git rev-parse --git-dir)/pr-review-changed-lines.json"
+"$PYTHON" "$CHECKS_DIR/diff_filter.py" changed-lines "$DIFF_BASE" > "$CHANGED_LINES_JSON"
+
+say ""
+say "═══════════════════════════════════════════════════════════════"
+say "  BrynQ Customer · Pre-Push Check"
+SHORT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "?")
+BRANCH=$(git branch --show-current 2>/dev/null || echo "?")
+say "  ${SHORT_SHA} · ${BRANCH}  (vs ${DIFF_BASE})"
+say "═══════════════════════════════════════════════════════════════"
+say ""
+
+EXIT_CODE=0
+
+# run_filtered: run a check, pipe output through diff_filter; PASS if no
+# violations remain on changed files/lines.
+run_filtered() {
+    local name="$1"; shift
+    local raw filtered rc=0
+    raw=$("$@" 2>&1 || true)
+    filtered=$("$PYTHON" "$CHECKS_DIR/diff_filter.py" filter "$CHANGED_LINES_JSON" <<<"$raw" || rc=$?)
+    if [ -n "$filtered" ]; then
+        printf '%s\n' "$filtered"
+        printf '%s\n' "$filtered" >> "$LOG_FILE"
+    fi
+    if [ $rc -eq 0 ]; then
+        say "  [PASS] $name"
+    else
+        say "  [FAIL] $name"
+    fi
+    return $rc
+}
+
+# --- repo hygiene ---
+say "── repo hygiene (file presence/absence) ──"
+run_filtered "repo_hygiene"  "$PYTHON" "$CHECKS_DIR/repo_hygiene.py" || EXIT_CODE=1
+say ""
+
+# --- dockerfile ---
+say "── dockerfile checks ──"
+run_filtered "dockerfile" "$PYTHON" "$CHECKS_DIR/dockerfile_check.py" || EXIT_CODE=1
+say ""
+
+# --- salure_helpers ban ---
+say "── salure_helpers import ban ──"
+run_filtered "salure_helpers_ban" "$PYTHON" "$CHECKS_DIR/salure_helpers_ban.py" || EXIT_CODE=1
+say ""
+
+# --- uv lock sync (only if pyproject.toml or uv.lock touched) ---
+say "── uv.lock ↔ pyproject.toml sync ──"
+if "$PYTHON" -c "import json; d=json.load(open('$CHANGED_LINES_JSON')); exit(0 if any(f in d for f in ('pyproject.toml','uv.lock')) else 1)"; then
+    run_filtered "uv_sync" "$PYTHON" "$CHECKS_DIR/uv_sync.py" || EXIT_CODE=1
+else
+    say "  [SKIP] uv_sync (pyproject/uv.lock untouched)"
+fi
+say ""
+
+# --- structural AST checks ---
+say "── interface structure (AST) ──"
+run_filtered "structure_check" "$PYTHON" "$CHECKS_DIR/structure_check.py" || EXIT_CODE=1
+say ""
+
+# --- version bump (only when pushing to master/main) ---
+if [ "$PUSH_TO_PROTECTED" = "1" ]; then
+    say "── version bump (push to protected branch) ──"
+    run_check "version_check" "$PYTHON" "$CHECKS_DIR/version_check.py" || EXIT_CODE=1
+    say ""
+else
+    say "── version bump (skipped — not pushing to master/main) ──"
+    say ""
+fi
+
+if [ $EXIT_CODE -eq 0 ]; then
+    say "═══════════════════════════════════════════════════════════════"
+    say "  ✅ ALL CHECKS PASSED"
+    say "═══════════════════════════════════════════════════════════════"
+else
+    say "═══════════════════════════════════════════════════════════════"
+    say "  ❌ PUSH BLOCKED — fix issues above"
+    say "═══════════════════════════════════════════════════════════════"
+    say ""
+    say "  📄 Report: $LOG_FILE"
+fi
+say ""
+
+exit $EXIT_CODE
