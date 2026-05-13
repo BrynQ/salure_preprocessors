@@ -1,7 +1,7 @@
 # Caller workflow — copy this to each customer repo at:
 #   .github/workflows/pr-checks.yml
 #
-# Calls the canonical reusable workflow in brynq-ai-toolkit. When the toolkit
+# Calls the canonical reusable workflow in brynq-shared-actions. When the toolkit
 # is updated, every customer repo picks up the new rules automatically.
 #
 # To make this a required check for auto-merge:
@@ -20,5 +20,5 @@ permissions:
 
 jobs:
   customer-pr-checks:
-    uses: BrynQ/brynq-ai-toolkit/.github/workflows/customer-pr-checks.yml@main
+    uses: BrynQ/brynq-shared-actions/.github/workflows/customer-pr-checks.yml@v1
     secrets: inherit
