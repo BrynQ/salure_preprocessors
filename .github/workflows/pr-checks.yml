@@ -13,6 +13,8 @@ name: PR Checks
 on:
   pull_request:
     branches: [master, main]
+    # `edited` so refreshing the BRYNQ-AI-REVIEW marker in the PR description re-runs AIREV001 (no close+reopen needed)
+    types: [opened, synchronize, reopened, edited]
 
 # Minimal least-privilege defaults; reusable workflow declares its own permissions block.
 permissions:
